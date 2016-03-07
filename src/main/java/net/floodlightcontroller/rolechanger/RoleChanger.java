@@ -16,14 +16,8 @@
 
 package net.floodlightcontroller.rolechanger;
 
-import java.io.UnsupportedEncodingException;
-import java.net.InetAddress;
-import java.net.NetworkInterface;
-import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
-import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,21 +34,18 @@ import net.floodlightcontroller.core.module.FloodlightModuleContext;
 import net.floodlightcontroller.core.module.FloodlightModuleException;
 import net.floodlightcontroller.core.module.IFloodlightModule;
 import net.floodlightcontroller.core.module.IFloodlightService;
+import net.floodlightcontroller.packet.BasePacket;
 import net.floodlightcontroller.packet.Data;
 import net.floodlightcontroller.packet.Ethernet;
-import net.floodlightcontroller.packet.IPacket;
-import net.floodlightcontroller.packet.IPv4;
-import net.floodlightcontroller.packet.UDP;
 import net.floodlightcontroller.restserver.IRestApiService;
+import net.floodlightcontroller.util.OFBundle;
 
-import org.projectfloodlight.openflow.protocol.OFAsyncConfigPropPacketInSlave;
 import org.projectfloodlight.openflow.protocol.OFAsyncGetReply;
 import org.projectfloodlight.openflow.protocol.OFAsyncGetRequest;
 import org.projectfloodlight.openflow.protocol.OFAsyncSet;
 import org.projectfloodlight.openflow.protocol.OFBarrierReply;
 import org.projectfloodlight.openflow.protocol.OFBarrierRequest;
 import org.projectfloodlight.openflow.protocol.OFControllerRole;
-import org.projectfloodlight.openflow.protocol.OFExperimenter;
 import org.projectfloodlight.openflow.protocol.OFGetConfigReply;
 import org.projectfloodlight.openflow.protocol.OFMessage;
 import org.projectfloodlight.openflow.protocol.OFPacketIn;
@@ -69,12 +60,9 @@ import org.projectfloodlight.openflow.protocol.action.OFAction;
 import org.projectfloodlight.openflow.protocol.match.MatchField;
 import org.projectfloodlight.openflow.types.DatapathId;
 import org.projectfloodlight.openflow.types.EthType;
-import org.projectfloodlight.openflow.types.IPv4Address;
-import org.projectfloodlight.openflow.types.IpProtocol;
 import org.projectfloodlight.openflow.types.MacAddress;
 import org.projectfloodlight.openflow.types.OFBufferId;
 import org.projectfloodlight.openflow.types.OFPort;
-import org.projectfloodlight.openflow.types.TransportPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -90,7 +78,10 @@ import com.google.common.util.concurrent.ListenableFuture;
 public class RoleChanger implements IFloodlightModule, IOFMessageListener,
 		IOFSwitchListener {
 
-	private static OFControllerRole currentRole;
+	private static OFControllerRole desiredInitialRole;
+	private static String controllerId;
+
+	private final static int RESERVED_ETH_TYPE = 65535;
 
 	// Our dependencies
 	protected IFloodlightProviderService floodlightProviderService;
@@ -102,69 +93,57 @@ public class RoleChanger implements IFloodlightModule, IOFMessageListener,
 
 	private static Logger log;
 
-	@Override
-	public String getName() {
-		return "rolechanger";
-	}
-
-	@Override
-	public boolean isCallbackOrderingPrereq(OFType type, String name) {
-		return false;
-	}
-
-	@Override
-	public boolean isCallbackOrderingPostreq(OFType type, String name) {
-		return false;
-	}
+	private final static boolean debug = true;
 
 	@Override
 	public net.floodlightcontroller.core.IListener.Command receive(
 			IOFSwitch sw, OFMessage msg, FloodlightContext cntx) {
+
 		switch (msg.getType()) {
+
 		case PACKET_IN:
 			OFPacketIn ofpi = (OFPacketIn) msg;
-			log.info("Received " + getPacketInString(ofpi, sw));
-			if (ofpi.getReason() == OFPacketInReason.PACKET_OUT) {
-				log.info("####        Received Packet-In from Packet-Out        ###");
-			} else {
-				String s = "test string";
-				try {
-					sendTestPacketOut(sw, s.getBytes());
-				} catch (UnsupportedEncodingException e) {
-					// TODO Auto-generated catch block
-					e.printStackTrace();
-				}
+			log.info("{}", getPacketInString(ofpi, sw));
+
+			if (sw.getControllerRole().equals(OFControllerRole.ROLE_SLAVE)) {
+				log.info("# Received Packet-In in slave!");
+			} else if (ofpi.getReason() == OFPacketInReason.PACKET_OUT
+					|| ofpi.getReason() == OFPacketInReason.ACTION) {
+				log.info("# Received Packet-In from Packet-Out");
+			} else if (!getInPort(ofpi).equals(OFPort.CONTROLLER)) {
+				String s = "hello from controller " + controllerId;
+				sendTestPacketOut(sw, s.getBytes());
 			}
 			return Command.CONTINUE;
+
 		case PACKET_OUT:
 			OFPacketOut pout = (OFPacketOut) msg;
-			log.info("Received {}", getPacketOutString(pout, sw));
+			Ethernet eth = new Ethernet();
+			eth.deserialize(pout.getData(), 0, pout.getData().length);
+			short type = (short) eth.getEtherType().getValue();
+			if (type != Ethernet.TYPE_LLDP && type != Ethernet.TYPE_BSN)
+				log.info("{}", getPacketOutString(pout, eth, sw));
 			return Command.CONTINUE;
+
 		case BARRIER_REPLY:
 			log.info("Received BARRIER_REPLY");
 			log.info("Barrier reply xid: {}", msg.getXid());
-
-			try {
-				sendTestPacketOut(sw, "test string 2".getBytes());
-			} catch (UnsupportedEncodingException e) {
-				// TODO Auto-generated catch block
-				e.printStackTrace();
-			}
-
+			sendTestPacketOut(sw, "test string 2".getBytes());
 			return Command.CONTINUE;
+
 		case ROLE_REPLY:
 			log.info("Received ROLE_REPLY");
 			// sendBarrier(sw);
 			return Command.CONTINUE;
+
 		case GET_ASYNC_REPLY:
-			log.info("Received GET_ASYNC_REPLY");
 			OFAsyncGetReply asyncReply = (OFAsyncGetReply) msg;
-			log.info("{}", asyncReply.toString());
+			log.info("Received GET_ASYNC_REPLY: {}", asyncReply.toString());
 			return Command.CONTINUE;
+
 		case GET_CONFIG_REPLY:
-			log.info("Received GET_CONFIG_REPLY");
 			OFGetConfigReply configReply = (OFGetConfigReply) msg;
-			log.info("{}", configReply.toString());
+			log.info("Received GET_CONFIG_REPLY: {}", configReply.toString());
 			return Command.CONTINUE;
 
 		default:
@@ -184,115 +163,98 @@ public class RoleChanger implements IFloodlightModule, IOFMessageListener,
 		return sw.getControllerRole().name().charAt(last_ + 1) + "";
 	}
 
-	public String getPacketOutString(OFPacketOut po, IOFSwitch sw) {
-		Ethernet eth = new Ethernet();
-		eth.deserialize(po.getData(), 0, po.getData().length);
-		
+	public String getPacketOutString(OFPacketOut po, Ethernet eth, IOFSwitch sw) {
+		String data = "";
+		if (eth.getEtherType().getValue() == RESERVED_ETH_TYPE) {
+			Data d = (Data) eth.getPayload();
+			data = new String(d.getData());
+		} else {
+			data = eth.getEtherType() + "";
+		}
 		return "" + po.getType() + " | In " + po.getInPort() + " | "
 				+ po.getActions() + " | From " + sw.getId() + " ("
-				+ getControllerRole(sw) + ")" + " | Eth: " + eth.toString()
-				;
+				+ getControllerRole(sw) + ")" + " | Data: " + data;
 	}
 
 	public String getPacketInString(OFPacketIn pi, IOFSwitch sw) {
 		Ethernet eth = new Ethernet();
 		eth.deserialize(pi.getData(), 0, pi.getData().length);
-		return "" + pi.getType() + " | In " + getInPort(pi) + " | "
-				+ pi.getReason() + " | " + pi.getMatch() + " | From "
-				+ sw.getId() + " (" + getControllerRole(sw) + ") | " + "\nEth: "
-				+ eth.toString();
-	}
-
-	static void displayInterfaceInformation(NetworkInterface netint)
-			throws SocketException {
-		log.info("Display name: {}", netint.getDisplayName());
-		log.info("Name: {}", netint.getName());
-		Enumeration<InetAddress> inetAddresses = netint.getInetAddresses();
-		for (InetAddress inetAddress : Collections.list(inetAddresses)) {
-			log.info("InetAddress: {}", inetAddress);
+		String data = "";
+		if (eth.getEtherType().getValue() == RESERVED_ETH_TYPE) {
+			Data d = (Data) eth.getPayload();
+			data = new String(d.getData());
+		} else {
+			data = eth.getEtherType().toString();
 		}
+		return "" + pi.getType() + "(xid=" + pi.getXid() + ") | In "
+				+ getInPort(pi) + " | " + pi.getReason() + " | "
+				+ pi.getMatch() + " | From " + sw.getId() + " ("
+				+ getControllerRole(sw) + ") | " + "Data: " + data;
 	}
 
-	private boolean once = true;
+	private void sendTestPacketOut(IOFSwitch sw, byte[] data) {
 
-	private void sendTestPacketOut(IOFSwitch sw, byte[] data) throws UnsupportedEncodingException {
+		List<OFAction> actions = buildActionOutputController(sw);
 
-		List<OFAction> actions = new ArrayList<OFAction>();
-		actions.add(sw.getOFFactory().actions().buildOutput()
-				.setPort(OFPort.CONTROLLER)
-				.setMaxLen(OFBufferId.NO_BUFFER.getInt()) // !!!!
-				.build());
+		Ethernet testPacket = buildSimpleEthernetWithData(data);
 
-		Ethernet l2 = new Ethernet();
-		l2.setEtherType(EthType.of(65535)); // reserved type
-		// set ethernet headers
-		l2.setSourceMACAddress(MacAddress.of("00:00:00:00:00:01"));
-		l2.setDestinationMACAddress(MacAddress.BROADCAST);
-		Data packetData = new Data();
-		String dataString = new String(data, "UTF-8");
-		log.info("String a meter na Data: " + dataString);
-		packetData.setData(dataString.getBytes());
-		l2.setPayload(packetData); // set payload for ethernet packet
+		OFPacketOut out = buildPacketOut(sw, OFPort.CONTROLLER, actions,
+				testPacket);
 
-		OFPacketOut out = sw.getOFFactory().buildPacketOut()
-				.setBufferId(OFBufferId.NO_BUFFER).setInPort(OFPort.CONTROLLER)
-				.setActions(actions).setData(l2.serialize()).build();
+		if (debug || log.isDebugEnabled())
+			log.info("{}", getOutGoingPacketOut(sw, out, data));
 
 		sw.write(out);
 
-		
-		// out.toString().replace("data=\\([^()]*\\)|[*+ ]+", "");
-
-		log.info("" + getOutGoingPacketOut(sw, out));
 	}
 
-	private String getOutGoingPacketOut(IOFSwitch sw, OFPacketOut out) {
-		String spo = out.toString().replaceAll("data=\\[.*?\\]", "");
-		String s = "Enviei Packet-Out para o switch " + sw.getId().toString()
-				+ ": " + spo + " |\ndata: " + new String(out.getData())
-				+ "; length " + out.getData().length + "";
+	private List<OFAction> buildActionOutputController(IOFSwitch sw) {
+		List<OFAction> actions = new ArrayList<OFAction>();
+		actions.add(sw.getOFFactory().actions().buildOutput()
+				.setPort(OFPort.CONTROLLER)
+				// .setMaxLen(OFBufferId.NO_BUFFER.getInt()) // TODO !!!!
+				.setMaxLen(0xFFFF).build());
+		return actions;
+	}
+
+	private Ethernet buildSimpleEthernetWithData(byte[] data) {
+		Ethernet l2 = new Ethernet();
+		l2.setEtherType(EthType.of(RESERVED_ETH_TYPE));
+		l2.setSourceMACAddress(MacAddress.of("00:00:00:00:00:01"));
+		l2.setDestinationMACAddress(MacAddress.BROADCAST);
+		Data packetData = new Data();
+		packetData.setData(data);
+		l2.setPayload(packetData);
+		return l2;
+	}
+
+	private OFPacketOut buildPacketOut(IOFSwitch sw, OFPort inPort,
+			List<OFAction> actions, BasePacket packet) {
+
+		byte[] packetBytes = packet.serialize();
+
+		return sw.getOFFactory().buildPacketOut()
+				.setBufferId(OFBufferId.NO_BUFFER).setInPort(inPort)
+				.setActions(actions).setData(packetBytes).build();
+	}
+
+	private String getOutGoingPacketOut(IOFSwitch sw, OFPacketOut out,
+			byte[] data) {
+		String spo = out.getType() + "(xid=" + out.getXid() + ", bufferId="
+				+ out.getBufferId() + ", inPort=" + out.getInPort()
+				+ ", actions=" + out.getActions() + ")";
+		String s = "Sending: " + spo + " | data: " + new String(data) + " to "
+				+ sw.getId().toString();
 		return s;
 	}
 
-	public static void sendBarrier(final IOFSwitch sw, final Semaphore sem) {
-
-		log.info("Sending barrier to switch {}", sw.getId().toString());
-		OFBarrierRequest barReq = sw.getOFFactory().buildBarrierRequest()
-				.build();
-
-		// send barrier and save ListenableFuture
-		ListenableFuture<OFBarrierReply> future = sw.writeRequest(barReq);
-
-		// add callback to execute when future computation is complete
-		Futures.addCallback(future, new FutureCallback<OFBarrierReply>() {
-
-			@Override
-			public void onFailure(Throwable arg0) {
-				log.error("Failed to receive BARRIER_REPLY from switch "
-						+ sw.getId());
-				sem.release();
-			}
-
-			@Override
-			public void onSuccess(OFBarrierReply reply) {
-				log.info("Received BARRIER_REPLY from switch " + sw.getId()
-						+ ". xid: {}", reply.getXid());
-				sem.release();
-			}
-
-		});
-
-		// log.info("BARRIER_REQUEST sent. xid: {}", barReq.getXid());
-
-	}
-
-	public static void sendRoleRequest(final IOFSwitch sw,
-			OFControllerRole role, final Semaphore sem) {
+	public static void sendRoleRequest(final IOFSwitch sw, OFControllerRole role) {
 
 		OFRoleRequest roleReq = sw.getOFFactory().buildRoleRequest()
 				.setRole(role).build();
 
-		log.info("Sending role request to switch {}", sw.getId().toString());
+		if (debug || log.isDebugEnabled())
+			log.info("Sending role request to switch {}", sw.getId().toString());
 
 		// send role request and save ListenableFuture
 		ListenableFuture<OFRoleReply> future = sw.writeRequest(roleReq);
@@ -317,8 +279,10 @@ public class RoleChanger implements IFloodlightModule, IOFMessageListener,
 
 		});
 
-		log.info("RoleRequest sent to switch " + sw.getId().toString()
-				+ ". xid: {}; role: {}", roleReq.getXid(), roleReq.getRole());
+		if (debug || log.isDebugEnabled())
+			log.info("RoleRequest sent to switch " + sw.getId().toString()
+					+ ". xid: {}; role: {}", roleReq.getXid(),
+					roleReq.getRole());
 	}
 
 	private void sendGetAsyncRequest(final IOFSwitch sw, final Semaphore sem) {
@@ -326,8 +290,9 @@ public class RoleChanger implements IFloodlightModule, IOFMessageListener,
 		OFAsyncGetRequest req = sw.getOFFactory().buildAsyncGetRequest()
 				.build();
 
-		log.info("Sending Async Get Request to switch {}", sw.getId()
-				.toString());
+		if (debug || log.isDebugEnabled())
+			log.info("Sending Async Get Request to switch {}", sw.getId()
+					.toString());
 
 		// send role request and save ListenableFuture
 		ListenableFuture<OFAsyncGetReply> future = sw.writeRequest(req);
@@ -354,9 +319,6 @@ public class RoleChanger implements IFloodlightModule, IOFMessageListener,
 
 		});
 
-		// log.info("AsyncGetRequest sent to switch {}",
-		// sw.getId().toString());
-
 	}
 
 	/**
@@ -380,10 +342,46 @@ public class RoleChanger implements IFloodlightModule, IOFMessageListener,
 				.setFlowRemovedMaskSlave(r.getFlowRemovedMaskEqualMaster())
 				.build();
 
-		log.info("Sending set async {} to switch {}", setConfig.toString(), sw
-				.getId().toString());
+		if (debug || log.isDebugEnabled())
+			log.info("Sending set async {} to switch {}", setConfig.toString(),
+					sw.getId().toString());
 
 		sw.write(setConfig);
+	}
+
+	public static void sendBarrier(final IOFSwitch sw, final Semaphore sem) {
+
+		if (debug || log.isDebugEnabled())
+			log.info("Sending barrier to switch {}", sw.getId().toString());
+
+		OFBarrierRequest barReq = sw.getOFFactory().buildBarrierRequest()
+				.build();
+
+		// send barrier and save ListenableFuture
+		ListenableFuture<OFBarrierReply> future = sw.writeRequest(barReq);
+
+		// add callback to execute when future computation is complete
+		Futures.addCallback(future, new FutureCallback<OFBarrierReply>() {
+
+			@Override
+			public void onFailure(Throwable arg0) {
+				log.error("Failed to receive BARRIER_REPLY from switch "
+						+ sw.getId());
+				sem.release();
+			}
+
+			@Override
+			public void onSuccess(OFBarrierReply reply) {
+				log.info("Received BARRIER_REPLY from switch " + sw.getId()
+						+ ". xid: {}", reply.getXid());
+				sem.release();
+			}
+
+		});
+
+		if (debug || log.isDebugEnabled())
+			log.info("BARRIER_REQUEST sent. xid: {}", barReq.getXid());
+
 	}
 
 	@Override
@@ -418,10 +416,18 @@ public class RoleChanger implements IFloodlightModule, IOFMessageListener,
 		Map<String, String> configOptions = context.getConfigParams(this);
 
 		// set current role for initial role in config file
-		currentRole = OFControllerRole.valueOf("ROLE_"
-				+ configOptions.get("initialRole"));
+		String role = configOptions.get("initialRole");
+		if (role != null)
+			desiredInitialRole = OFControllerRole.valueOf("ROLE_" + role);
+		else
+			desiredInitialRole = OFControllerRole.ROLE_EQUAL;
+		
+		controllerId = configOptions.get("controllerId");
+		if (controllerId == null)
+			controllerId = "c";
 
-		log.info("Initial Role for switches: {}", currentRole);
+		if (debug || log.isDebugEnabled())
+			log.info("Initial Role for switches: {}", desiredInitialRole);
 	}
 
 	@Override
@@ -430,7 +436,8 @@ public class RoleChanger implements IFloodlightModule, IOFMessageListener,
 				this);
 		floodlightProviderService.addOFMessageListener(OFType.ROLE_REPLY, this);
 		floodlightProviderService.addOFMessageListener(OFType.PACKET_IN, this);
-		floodlightProviderService.addOFMessageListener(OFType.PACKET_OUT, this);
+		// floodlightProviderService.addOFMessageListener(OFType.PACKET_OUT,
+		// this);
 		floodlightProviderService.addOFMessageListener(OFType.GET_ASYNC_REPLY,
 				this);
 		floodlightProviderService.addOFMessageListener(OFType.GET_CONFIG_REPLY,
@@ -440,7 +447,6 @@ public class RoleChanger implements IFloodlightModule, IOFMessageListener,
 
 	@Override
 	public void switchAdded(DatapathId switchId) {
-		// TODO Auto-generated method stub
 
 	}
 
@@ -451,54 +457,72 @@ public class RoleChanger implements IFloodlightModule, IOFMessageListener,
 
 	@Override
 	public void switchActivated(DatapathId switchId) {
-		// send role request to equal when a switch is added to the network view
-		// (as active)
+
 		final IOFSwitch sw = switchService.getSwitch(switchId);
 
-		log.info("New switch added: {} ", switchId.toString());
+		if (debug || log.isDebugEnabled())
+			log.info("New switch added: {}; Role on switch: {} ",
+					switchId.toString(), sw.getControllerRole().toString());
 
-		log.info("Role on switch: {} ", sw.getControllerRole().toString());
-
-		final Semaphore sem = new Semaphore(0);
-
-		if (sw.getControllerRole() != currentRole) {
-
-			sendRoleRequest(sw, currentRole, sem);
-			try {
-
-				sendBarrier(sw, sem); // sem = 1 after receive
-
-				// sem unlocked means barrier reply was received
-				sem.acquire(); // sem = 0
-
-				sendGetAsyncRequest(sw, sem); // sem = 1 after receive
-
-				// sem unlocked means async reply was received
-				sem.acquire(); // sem = 0
-
-				sendSetAsync(sw, lastAsyncGetReply);
-
-				sendGetAsyncRequest(sw, sem); // sem = 1 after receive
-
-			} catch (InterruptedException e) {
-				// TODO Auto-generated catch block
-				e.printStackTrace();
+		if (sw.getControllerRole() != desiredInitialRole) {
+			sendRoleRequest(sw, desiredInitialRole);
+			if (desiredInitialRole == OFControllerRole.ROLE_SLAVE) {
+				setSlaveAsyncConfig(sw);
 			}
-
 		}
 
+	}
+
+	private void setSlaveAsyncConfig(IOFSwitch sw) {
+		final Semaphore sem = new Semaphore(0);
+		try {
+			sendBarrier(sw, sem); // sem = 1 after receive
+
+			// sem unlocked means barrier reply was received
+			sem.acquire(); // sem = 0
+
+			sendGetAsyncRequest(sw, sem); // sem = 1 after receive
+
+			// sem unlocked means async reply was received
+			sem.acquire(); // sem = 0
+
+			sendSetAsync(sw, lastAsyncGetReply);
+
+			sendGetAsyncRequest(sw, sem); // sem = 1 after receive
+
+		} catch (InterruptedException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
 	}
 
 	@Override
 	public void switchPortChanged(DatapathId switchId, OFPortDesc port,
 			PortChangeType type) {
-		// TODO Auto-generated method stub
 
 	}
 
 	@Override
 	public void switchChanged(DatapathId switchId) {
-		// TODO Auto-generated method stub
 
+	}
+
+	@Override
+	public String getName() {
+		return "rolechanger";
+	}
+
+	@Override
+	public boolean isCallbackOrderingPrereq(OFType type, String name) {
+		return false;
+	}
+
+	@Override
+	public boolean isCallbackOrderingPostreq(OFType type, String name) {
+		if (type.equals(OFType.PACKET_IN)) {
+			return true;
+		} else {
+			return false;
+		}
 	}
 }

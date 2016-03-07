@@ -59,6 +59,7 @@ import org.projectfloodlight.openflow.protocol.OFActionType;
 import org.projectfloodlight.openflow.protocol.OFBsnControllerConnection;
 import org.projectfloodlight.openflow.protocol.OFBsnControllerConnectionState;
 import org.projectfloodlight.openflow.protocol.OFBsnControllerConnectionsReply;
+import org.projectfloodlight.openflow.protocol.OFBundleAddMsg;
 import org.projectfloodlight.openflow.protocol.OFBundleCtrlMsg;
 import org.projectfloodlight.openflow.protocol.OFCapabilities;
 import org.projectfloodlight.openflow.protocol.OFControllerRole;
@@ -106,8 +107,7 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
  * This is the internal representation of an openflow switch.
  */
 public class OFSwitch implements IOFSwitchBackend {
-	protected static final Logger log =
-			LoggerFactory.getLogger(OFSwitch.class);
+	protected static final Logger log = LoggerFactory.getLogger(OFSwitch.class);
 
 	protected final ConcurrentMap<Object, Object> attributes;
 	protected final IOFSwitchManager switchManager;
@@ -144,30 +144,40 @@ public class OFSwitch implements IOFSwitchBackend {
 
 	public static final int OFSWITCH_APP_ID = ident(5);
 
-	private TableId maxTableToGetTableMissFlow = TableId.of(4); /* this should cover most HW switches that have a couple SW flow tables */
-	
+	private TableId maxTableToGetTableMissFlow = TableId.of(4); /*
+																 * this should
+																 * cover most HW
+																 * switches that
+																 * have a couple
+																 * SW flow
+																 * tables
+																 */
+
 	private final ScheduledExecutorService scheduler;
-	
+
 	private static final Set<OFType> BUNDLE_VALID_MSG = Sets.immutableEnumSet(
-			OFType.FLOW_MOD, 
-			OFType.TABLE_MOD, 
-			//OFType.GROUP_MOD, // TODO: ovs nao suporta OFGroupDeleteVer14
-			OFType.PORT_MOD, 
-			OFType.METER_MOD);
+			OFType.FLOW_MOD, OFType.TABLE_MOD,
+			// OFType.GROUP_MOD, // TODO: ovs nao suporta OFGroupDeleteVer14
+			OFType.PORT_MOD, OFType.METER_MOD, OFType.PACKET_OUT);
+
+	private static final long BUNDLE_TIMEOUT_SECONDS = 1L;
 
 	static {
 		AppCookie.registerApp(OFSwitch.OFSWITCH_APP_ID, "switch");
 	}
 
-	public OFSwitch(IOFConnectionBackend connection, @Nonnull OFFactory factory, @Nonnull IOFSwitchManager switchManager,
+	public OFSwitch(IOFConnectionBackend connection,
+			@Nonnull OFFactory factory,
+			@Nonnull IOFSwitchManager switchManager,
 			@Nonnull DatapathId datapathId) {
-		if(connection == null)
+		if (connection == null)
 			throw new NullPointerException("connection must not be null");
-		if(!connection.getAuxId().equals(OFAuxId.MAIN))
-			throw new IllegalArgumentException("connection must be the main connection");
-		if(factory == null)
+		if (!connection.getAuxId().equals(OFAuxId.MAIN))
+			throw new IllegalArgumentException(
+					"connection must be the main connection");
+		if (factory == null)
 			throw new NullPointerException("factory must not be null");
-		if(switchManager == null)
+		if (switchManager == null)
 			throw new NullPointerException("switchManager must not be null");
 
 		this.connected = true;
@@ -188,7 +198,8 @@ public class OFSwitch implements IOFSwitchBackend {
 		this.controllerConnections = ImmutableMap.of();
 
 		// Defaults properties for an ideal switch
-		this.setAttribute(PROP_FASTWILDCARDS, EnumSet.allOf(OFFlowWildcards.class));
+		this.setAttribute(PROP_FASTWILDCARDS,
+				EnumSet.allOf(OFFlowWildcards.class));
 		this.setAttribute(PROP_SUPPORTS_OFPP_FLOOD, Boolean.TRUE);
 		this.setAttribute(PROP_SUPPORTS_OFPP_TABLE, Boolean.TRUE);
 
@@ -197,37 +208,54 @@ public class OFSwitch implements IOFSwitchBackend {
 		currentBundle = null;
 		scheduler = Executors.newScheduledThreadPool(1);
 	}
-	
+
 	private class BundleCommiter implements Runnable {
 
 		private final OFBundle b;
 		private final OFSwitch sw;
+
 		public BundleCommiter(OFSwitch sw, OFBundle b) {
 			this.sw = sw;
 			this.b = b;
 		}
-		
+
 		@Override
 		public void run() {
-			log.info("BundleCommiter activated. Commiting bundle {}", b.getBundleId());
+			log.info("BundleCommiter activated. Commiting bundle {}",
+					b.getBundleId());
+			StringBuilder sb = new StringBuilder();
+			System.out.println();
+			sb.append(" Messages in the bundle: ");
+			for (OFMessage m : b.getMsgsInBundle()) {
+				OFBundleAddMsg addMsg = (OFBundleAddMsg) m;
+				sb.append(addMsg.getData().getType() + " ");
+			}
+
+			log.info("{}", sb.toString());
+			
 			b.closeAndCommit(new FutureCallback<OFBundleCtrlMsg>() {
-				
+
 				@Override
 				public void onSuccess(OFBundleCtrlMsg arg0) {
-					log.info("Received commit reply message for bundle {}. Reply: {}", b.getBundleId(), arg0.toString());
-					/*for (OFMessage m : b.getMsgsInBundle()) {
-						switchManager.handleOutgoingMessage(sw, m);
-					}*/
+					log.info(
+							"Received commit reply message for bundle {}. Reply: {}",
+							b.getBundleId(), arg0.toString());
+					/*
+					 * for (OFMessage m : b.getMsgsInBundle()) {
+					 * switchManager.handleOutgoingMessage(sw, m); }
+					 */
 				}
-				
+
 				@Override
 				public void onFailure(Throwable arg0) {
-					log.error("Received failed commit reply message for bundle {}", b.getBundleId());
+					log.error(
+							"Received failed commit reply message for bundle {}",
+							b.getBundleId());
 				}
 			});
-			
+
 		}
-		
+
 	}
 
 	private static int ident(int i) {
@@ -241,36 +269,32 @@ public class OFSwitch implements IOFSwitchBackend {
 
 	/**
 	 * Manages the ports of this switch.
-	 *
+	 * 
 	 * Provides methods to query and update the stored ports. The class ensures
-	 * that every port name and port number is unique. When updating ports
-	 * the class checks if port number <-> port name mappings have change due
-	 * to the update. If a new port P has number and port that are inconsistent
-	 * with the previous mapping(s) the class will delete all previous ports
-	 * with name or number of the new port and then add the new port.
-	 *
+	 * that every port name and port number is unique. When updating ports the
+	 * class checks if port number <-> port name mappings have change due to the
+	 * update. If a new port P has number and port that are inconsistent with
+	 * the previous mapping(s) the class will delete all previous ports with
+	 * name or number of the new port and then add the new port.
+	 * 
 	 * Port names are stored as-is but they are compared case-insensitive
-	 *
+	 * 
 	 * The methods that change the stored ports return a list of
-	 * PortChangeEvents that represent the changes that have been applied
-	 * to the port list so that IOFSwitchListeners can be notified about the
-	 * changes.
-	 *
-	 * Implementation notes:
-	 * - We keep several different representations of the ports to allow for
-	 *   fast lookups
-	 * - Ports are stored in unchangeable lists. When a port is modified new
-	 *   data structures are allocated.
-	 * - We use a read-write-lock for synchronization, so multiple readers are
-	 *   allowed.
+	 * PortChangeEvents that represent the changes that have been applied to the
+	 * port list so that IOFSwitchListeners can be notified about the changes.
+	 * 
+	 * Implementation notes: - We keep several different representations of the
+	 * ports to allow for fast lookups - Ports are stored in unchangeable lists.
+	 * When a port is modified new data structures are allocated. - We use a
+	 * read-write-lock for synchronization, so multiple readers are allowed.
 	 */
 	protected static class PortManager {
 		private final ReentrantReadWriteLock lock;
 		private List<OFPortDesc> portList;
 		private List<OFPortDesc> enabledPortList;
 		private List<OFPort> enabledPortNumbers;
-		private Map<OFPort,OFPortDesc> portsByNumber;
-		private Map<String,OFPortDesc> portsByName;
+		private Map<OFPort, OFPortDesc> portsByNumber;
+		private Map<String, OFPortDesc> portsByName;
 
 		public PortManager() {
 			this.lock = new ReentrantReadWriteLock();
@@ -282,33 +306,30 @@ public class OFSwitch implements IOFSwitchBackend {
 		}
 
 		/**
-		 * Set the internal data structure storing this switch's port
-		 * to the ports specified by newPortsByNumber
-		 *
+		 * Set the internal data structure storing this switch's port to the
+		 * ports specified by newPortsByNumber
+		 * 
 		 * CALLER MUST HOLD WRITELOCK
-		 *
+		 * 
 		 * @param newPortsByNumber
-		 * @throws IllegaalStateException if called without holding the
-		 * writelock
+		 * @throws IllegaalStateException
+		 *             if called without holding the writelock
 		 */
 		private void updatePortsWithNewPortsByNumber(
-				Map<OFPort,OFPortDesc> newPortsByNumber) {
+				Map<OFPort, OFPortDesc> newPortsByNumber) {
 			if (!lock.writeLock().isHeldByCurrentThread()) {
-				throw new IllegalStateException("Method called without " +
-						"holding writeLock");
+				throw new IllegalStateException("Method called without "
+						+ "holding writeLock");
 			}
-			Map<String,OFPortDesc> newPortsByName =
-					new HashMap<String, OFPortDesc>();
-			List<OFPortDesc> newPortList =
-					new ArrayList<OFPortDesc>();
-			List<OFPortDesc> newEnabledPortList =
-					new ArrayList<OFPortDesc>();
+			Map<String, OFPortDesc> newPortsByName = new HashMap<String, OFPortDesc>();
+			List<OFPortDesc> newPortList = new ArrayList<OFPortDesc>();
+			List<OFPortDesc> newEnabledPortList = new ArrayList<OFPortDesc>();
 			List<OFPort> newEnabledPortNumbers = new ArrayList<OFPort>();
 
-			for(OFPortDesc p: newPortsByNumber.values()) {
+			for (OFPortDesc p : newPortsByNumber.values()) {
 				newPortList.add(p);
 				newPortsByName.put(p.getName().toLowerCase(), p);
-				if (!p.getState().contains(OFPortState.LINK_DOWN) 
+				if (!p.getState().contains(OFPortState.LINK_DOWN)
 						&& !p.getConfig().contains(OFPortConfig.PORT_DOWN)) {
 					if (!newEnabledPortList.contains(p)) {
 						newEnabledPortList.add(p);
@@ -319,40 +340,36 @@ public class OFSwitch implements IOFSwitchBackend {
 				}
 			}
 			portsByName = Collections.unmodifiableMap(newPortsByName);
-			portsByNumber =
-					Collections.unmodifiableMap(newPortsByNumber);
-			enabledPortList =
-					Collections.unmodifiableList(newEnabledPortList);
-			enabledPortNumbers =
-					Collections.unmodifiableList(newEnabledPortNumbers);
+			portsByNumber = Collections.unmodifiableMap(newPortsByNumber);
+			enabledPortList = Collections.unmodifiableList(newEnabledPortList);
+			enabledPortNumbers = Collections
+					.unmodifiableList(newEnabledPortNumbers);
 			portList = Collections.unmodifiableList(newPortList);
 		}
 
 		/**
-		 * Handle a OFPortStatus delete message for the given port.
-		 * Updates the internal port maps/lists of this switch and returns
-		 * the PortChangeEvents caused by the delete. If the given port
-		 * exists as it, it will be deleted. If the name<->number for the
-		 * given port is inconsistent with the ports stored by this switch
-		 * the method will delete all ports with the number or name of the
-		 * given port.
-		 *
+		 * Handle a OFPortStatus delete message for the given port. Updates the
+		 * internal port maps/lists of this switch and returns the
+		 * PortChangeEvents caused by the delete. If the given port exists as
+		 * it, it will be deleted. If the name<->number for the given port is
+		 * inconsistent with the ports stored by this switch the method will
+		 * delete all ports with the number or name of the given port.
+		 * 
 		 * This method will increment error/warn counters and log
-		 *
-		 * @param delPort the port from the port status message that should
-		 * be deleted.
+		 * 
+		 * @param delPort
+		 *            the port from the port status message that should be
+		 *            deleted.
 		 * @return ordered collection of port changes applied to this switch
 		 */
-		private OrderedCollection<PortChangeEvent>
-		handlePortStatusDelete(OFPortDesc delPort) {
-			OrderedCollection<PortChangeEvent> events =
-					new LinkedHashSetWrapper<PortChangeEvent>();
+		private OrderedCollection<PortChangeEvent> handlePortStatusDelete(
+				OFPortDesc delPort) {
+			OrderedCollection<PortChangeEvent> events = new LinkedHashSetWrapper<PortChangeEvent>();
 			lock.writeLock().lock();
 			try {
-				Map<OFPort,OFPortDesc> newPortByNumber =
-						new HashMap<OFPort, OFPortDesc>(portsByNumber);
-				OFPortDesc prevPort =
-						portsByNumber.get(delPort.getPortNo());
+				Map<OFPort, OFPortDesc> newPortByNumber = new HashMap<OFPort, OFPortDesc>(
+						portsByNumber);
+				OFPortDesc prevPort = portsByNumber.get(delPort.getPortNo());
 				if (prevPort == null) {
 					// so such port. Do we have a port with the name?
 					prevPort = portsByName.get(delPort.getName());
@@ -391,30 +408,32 @@ public class OFSwitch implements IOFSwitchBackend {
 		/**
 		 * Handle a OFPortStatus message, update the internal data structures
 		 * that store ports and return the list of OFChangeEvents.
-		 *
+		 * 
 		 * This method will increment error/warn counters and log
-		 *
+		 * 
 		 * @param ps
 		 * @return
 		 */
-		@SuppressFBWarnings(value="SF_SWITCH_FALLTHROUGH")
-		public OrderedCollection<PortChangeEvent> handlePortStatusMessage(OFPortStatus ps) {
+		@SuppressFBWarnings(value = "SF_SWITCH_FALLTHROUGH")
+		public OrderedCollection<PortChangeEvent> handlePortStatusMessage(
+				OFPortStatus ps) {
 			if (ps == null) {
-				throw new NullPointerException("OFPortStatus message must " +
-						"not be null");
+				throw new NullPointerException("OFPortStatus message must "
+						+ "not be null");
 			}
 			lock.writeLock().lock();
 			try {
 				OFPortDesc port = ps.getDesc();
 				OFPortReason reason = ps.getReason();
 				if (reason == null) {
-					throw new IllegalArgumentException("Unknown PortStatus " +
-							"reason code " + ps.getReason());
+					throw new IllegalArgumentException("Unknown PortStatus "
+							+ "reason code " + ps.getReason());
 				}
 
 				if (log.isDebugEnabled()) {
-					log.debug("Handling OFPortStatus: {} for {}",
-							reason, String.format("%s (%d)", port.getName(), port.getPortNo().getPortNumber()));
+					log.debug("Handling OFPortStatus: {} for {}", reason,
+							String.format("%s (%d)", port.getName(), port
+									.getPortNo().getPortNumber()));
 				}
 
 				if (reason == OFPortReason.DELETE)
@@ -424,11 +443,11 @@ public class OFSwitch implements IOFSwitchBackend {
 				// doesn't specify what uniquely identifies a port the
 				// notion of ADD vs. MODIFY can also be hazy. So we just
 				// compare the new port to the existing ones.
-				Map<OFPort,OFPortDesc> newPortByNumber =
-						new HashMap<OFPort, OFPortDesc>(portsByNumber);
+				Map<OFPort, OFPortDesc> newPortByNumber = new HashMap<OFPort, OFPortDesc>(
+						portsByNumber);
 				OrderedCollection<PortChangeEvent> events = getSinglePortChanges(port);
-				for (PortChangeEvent e: events) {
-					switch(e.type) {
+				for (PortChangeEvent e : events) {
+					switch (e.type) {
 					case DELETE:
 						newPortByNumber.remove(e.port.getPortNo());
 						break;
@@ -455,48 +474,52 @@ public class OFSwitch implements IOFSwitchBackend {
 
 		/**
 		 * Given a new or modified port newPort, returns the list of
-		 * PortChangeEvents to "transform" the current ports stored by
-		 * this switch to include / represent the new port. The ports stored
-		 * by this switch are <b>NOT</b> updated.
-		 *
-		 * This method acquires the readlock and is thread-safe by itself.
-		 * Most callers will need to acquire the write lock before calling
-		 * this method though (if the caller wants to update the ports stored
-		 * by this switch)
-		 *
-		 * @param newPort the new or modified port.
+		 * PortChangeEvents to "transform" the current ports stored by this
+		 * switch to include / represent the new port. The ports stored by this
+		 * switch are <b>NOT</b> updated.
+		 * 
+		 * This method acquires the readlock and is thread-safe by itself. Most
+		 * callers will need to acquire the write lock before calling this
+		 * method though (if the caller wants to update the ports stored by this
+		 * switch)
+		 * 
+		 * @param newPort
+		 *            the new or modified port.
 		 * @return the list of changes
 		 */
-		public OrderedCollection<PortChangeEvent>
-		getSinglePortChanges(OFPortDesc newPort) {
+		public OrderedCollection<PortChangeEvent> getSinglePortChanges(
+				OFPortDesc newPort) {
 			lock.readLock().lock();
 			try {
-				OrderedCollection<PortChangeEvent> events =
-						new LinkedHashSetWrapper<PortChangeEvent>();
+				OrderedCollection<PortChangeEvent> events = new LinkedHashSetWrapper<PortChangeEvent>();
 				// Check if we have a port by the same number in our
 				// old map.
-				OFPortDesc prevPort =
-						portsByNumber.get(newPort.getPortNo());
+				OFPortDesc prevPort = portsByNumber.get(newPort.getPortNo());
 				if (newPort.equals(prevPort)) {
 					// nothing has changed
 					return events;
 				}
 
-				if (prevPort != null &&
-						prevPort.getName().equals(newPort.getName())) {
+				if (prevPort != null
+						&& prevPort.getName().equals(newPort.getName())) {
 					// A simple modify of a exiting port
 					// A previous port with this number exists and it's name
 					// also matches the new port. Find the differences
-					if ((!prevPort.getState().contains(OFPortState.LINK_DOWN) 
-							&& !prevPort.getConfig().contains(OFPortConfig.PORT_DOWN)) 
-							&& (newPort.getState().contains(OFPortState.LINK_DOWN) 
-									|| newPort.getConfig().contains(OFPortConfig.PORT_DOWN))) {
+					if ((!prevPort.getState().contains(OFPortState.LINK_DOWN) && !prevPort
+							.getConfig().contains(OFPortConfig.PORT_DOWN))
+							&& (newPort.getState().contains(
+									OFPortState.LINK_DOWN) || newPort
+									.getConfig().contains(
+											OFPortConfig.PORT_DOWN))) {
 						events.add(new PortChangeEvent(newPort,
 								PortChangeType.DOWN));
-					} else if ((prevPort.getState().contains(OFPortState.LINK_DOWN) 
-							|| prevPort.getConfig().contains(OFPortConfig.PORT_DOWN)) 
-							&& (!newPort.getState().contains(OFPortState.LINK_DOWN) 
-									&& !newPort.getConfig().contains(OFPortConfig.PORT_DOWN))) {
+					} else if ((prevPort.getState().contains(
+							OFPortState.LINK_DOWN) || prevPort.getConfig()
+							.contains(OFPortConfig.PORT_DOWN))
+							&& (!newPort.getState().contains(
+									OFPortState.LINK_DOWN) && !newPort
+									.getConfig().contains(
+											OFPortConfig.PORT_DOWN))) {
 						events.add(new PortChangeEvent(newPort,
 								PortChangeType.UP));
 					} else {
@@ -540,81 +563,81 @@ public class OFSwitch implements IOFSwitchBackend {
 		/**
 		 * Compare the current ports of this switch to the newPorts list and
 		 * return the changes that would be applied to transform the current
-		 * ports to the new ports. No internal data structures are updated
-		 * see {@link #compareAndUpdatePorts(List, boolean)}
-		 *
-		 * @param newPorts the list of new ports
+		 * ports to the new ports. No internal data structures are updated see
+		 * {@link #compareAndUpdatePorts(List, boolean)}
+		 * 
+		 * @param newPorts
+		 *            the list of new ports
 		 * @return The list of differences between the current ports and
-		 * newPortList
+		 *         newPortList
 		 */
-		public OrderedCollection<PortChangeEvent>
-		comparePorts(Collection<OFPortDesc> newPorts) {
+		public OrderedCollection<PortChangeEvent> comparePorts(
+				Collection<OFPortDesc> newPorts) {
 			return compareAndUpdatePorts(newPorts, false);
 		}
 
 		/**
 		 * Compare the current ports of this switch to the newPorts list and
 		 * return the changes that would be applied to transform the current
-		 * ports to the new ports. No internal data structures are updated
-		 * see {@link #compareAndUpdatePorts(List, boolean)}
-		 *
-		 * @param newPorts the list of new ports
+		 * ports to the new ports. No internal data structures are updated see
+		 * {@link #compareAndUpdatePorts(List, boolean)}
+		 * 
+		 * @param newPorts
+		 *            the list of new ports
 		 * @return The list of differences between the current ports and
-		 * newPortList
+		 *         newPortList
 		 */
-		public OrderedCollection<PortChangeEvent>
-		updatePorts(Collection<OFPortDesc> newPorts) {
+		public OrderedCollection<PortChangeEvent> updatePorts(
+				Collection<OFPortDesc> newPorts) {
 			return compareAndUpdatePorts(newPorts, true);
 		}
 
 		/**
-		 * Compare the current ports stored in this switch instance with the
-		 * new port list given and return the differences in the form of
+		 * Compare the current ports stored in this switch instance with the new
+		 * port list given and return the differences in the form of
 		 * PortChangeEvents. If the doUpdate flag is true, newPortList will
 		 * replace the current list of this switch (and update the port maps)
-		 *
-		 * Implementation note:
-		 * Since this method can optionally modify the current ports and
-		 * since it's not possible to upgrade a read-lock to a write-lock
-		 * we need to hold the write-lock for the entire operation. If this
-		 * becomes a problem and if compares() are common we can consider
-		 * splitting in two methods but this requires lots of code duplication
-		 *
-		 * @param newPorts the list of new ports.
-		 * @param doUpdate If true the newPortList will replace the current
-		 * port list for this switch. If false this switch will not be changed.
+		 * 
+		 * Implementation note: Since this method can optionally modify the
+		 * current ports and since it's not possible to upgrade a read-lock to a
+		 * write-lock we need to hold the write-lock for the entire operation.
+		 * If this becomes a problem and if compares() are common we can
+		 * consider splitting in two methods but this requires lots of code
+		 * duplication
+		 * 
+		 * @param newPorts
+		 *            the list of new ports.
+		 * @param doUpdate
+		 *            If true the newPortList will replace the current port list
+		 *            for this switch. If false this switch will not be changed.
 		 * @return The list of differences between the current ports and
-		 * newPorts
-		 * @throws NullPointerException if newPortsList is null
-		 * @throws IllegalArgumentException if either port names or port numbers
-		 * are duplicated in the newPortsList.
+		 *         newPorts
+		 * @throws NullPointerException
+		 *             if newPortsList is null
+		 * @throws IllegalArgumentException
+		 *             if either port names or port numbers are duplicated in
+		 *             the newPortsList.
 		 */
 		private OrderedCollection<PortChangeEvent> compareAndUpdatePorts(
-				Collection<OFPortDesc> newPorts,
-				boolean doUpdate) {
+				Collection<OFPortDesc> newPorts, boolean doUpdate) {
 			if (newPorts == null) {
 				throw new NullPointerException("newPortsList must not be null");
 			}
 			lock.writeLock().lock();
 			try {
-				OrderedCollection<PortChangeEvent> events =
-						new LinkedHashSetWrapper<PortChangeEvent>();
+				OrderedCollection<PortChangeEvent> events = new LinkedHashSetWrapper<PortChangeEvent>();
 
-				Map<OFPort,OFPortDesc> newPortsByNumber =
-						new HashMap<OFPort, OFPortDesc>();
-				Map<String,OFPortDesc> newPortsByName =
-						new HashMap<String, OFPortDesc>();
-				List<OFPortDesc> newEnabledPortList =
-						new ArrayList<OFPortDesc>();
-				List<OFPort> newEnabledPortNumbers =
-						new ArrayList<OFPort>();
-				List<OFPortDesc> newPortsList =
-						new ArrayList<OFPortDesc>(newPorts);
+				Map<OFPort, OFPortDesc> newPortsByNumber = new HashMap<OFPort, OFPortDesc>();
+				Map<String, OFPortDesc> newPortsByName = new HashMap<String, OFPortDesc>();
+				List<OFPortDesc> newEnabledPortList = new ArrayList<OFPortDesc>();
+				List<OFPort> newEnabledPortNumbers = new ArrayList<OFPort>();
+				List<OFPortDesc> newPortsList = new ArrayList<OFPortDesc>(
+						newPorts);
 
-				for (OFPortDesc p: newPortsList) {
+				for (OFPortDesc p : newPortsList) {
 					if (p == null) {
-						throw new NullPointerException("portList must not " +
-								"contain null values");
+						throw new NullPointerException("portList must not "
+								+ "contain null values");
 					}
 
 					// Add the port to the new maps and lists and check
@@ -622,19 +645,23 @@ public class OFSwitch implements IOFSwitchBackend {
 					OFPortDesc duplicatePort;
 					duplicatePort = newPortsByNumber.put(p.getPortNo(), p);
 					if (duplicatePort != null) {
-						String msg = String.format("Cannot have two ports " +
-								"with the same number: %s <-> %s",
-								String.format("%s (%d)", p.getName(), p.getPortNo().getPortNumber()),
-								String.format("%s (%d)", duplicatePort.getName(), duplicatePort.getPortNo().getPortNumber()));
+						String msg = String.format("Cannot have two ports "
+								+ "with the same number: %s <-> %s", String
+								.format("%s (%d)", p.getName(), p.getPortNo()
+										.getPortNumber()), String.format(
+								"%s (%d)", duplicatePort.getName(),
+								duplicatePort.getPortNo().getPortNumber()));
 						throw new IllegalArgumentException(msg);
 					}
-					duplicatePort =
-							newPortsByName.put(p.getName().toLowerCase(), p);
+					duplicatePort = newPortsByName.put(p.getName()
+							.toLowerCase(), p);
 					if (duplicatePort != null) {
-						String msg = String.format("Cannot have two ports " +
-								"with the same name: %s <-> %s",
-								String.format("%s (%d)", p.getName(), p.getPortNo().getPortNumber()),
-								String.format("%s (%d)", duplicatePort.getName(), duplicatePort.getPortNo().getPortNumber()));
+						String msg = String.format("Cannot have two ports "
+								+ "with the same name: %s <-> %s", String
+								.format("%s (%d)", p.getName(), p.getPortNo()
+										.getPortNumber()), String.format(
+								"%s (%d)", duplicatePort.getName(),
+								duplicatePort.getPortNo().getPortNumber()));
 						throw new IllegalArgumentException(msg);
 					}
 					// Enabled = not down admin (config) or phys (state)
@@ -656,24 +683,22 @@ public class OFSwitch implements IOFSwitchBackend {
 				// to we can handle changed name<->number mappings correctly
 				// We could pull it into the loop of we address this but
 				// it's probably not worth it
-				for (OFPortDesc oldPort: this.portList) {
+				for (OFPortDesc oldPort : this.portList) {
 					if (!newPortsByNumber.containsKey(oldPort.getPortNo())) {
-						PortChangeEvent ev =
-								new PortChangeEvent(oldPort,
-										PortChangeType.DELETE);
+						PortChangeEvent ev = new PortChangeEvent(oldPort,
+								PortChangeType.DELETE);
 						events.add(ev);
 					}
 				}
 
-
 				if (doUpdate) {
 					portsByName = Collections.unmodifiableMap(newPortsByName);
-					portsByNumber =
-							Collections.unmodifiableMap(newPortsByNumber);
-					enabledPortList =
-							Collections.unmodifiableList(newEnabledPortList);
-					enabledPortNumbers =
-							Collections.unmodifiableList(newEnabledPortNumbers);
+					portsByNumber = Collections
+							.unmodifiableMap(newPortsByNumber);
+					enabledPortList = Collections
+							.unmodifiableList(newEnabledPortList);
+					enabledPortNumbers = Collections
+							.unmodifiableList(newEnabledPortNumbers);
 					portList = Collections.unmodifiableList(newPortsList);
 				}
 				return events;
@@ -730,12 +755,10 @@ public class OFSwitch implements IOFSwitchBackend {
 			}
 		}
 	}
-	
-	
 
 	protected static class SwitchRoleMessageValidator {
 		private static final Map<OFVersion, Set<OFType>> invalidSlaveMsgsByOFVersion;
-		
+
 		static {
 			Map<OFVersion, Set<OFType>> m = new HashMap<OFVersion, Set<OFType>>();
 			Set<OFType> s = new HashSet<OFType>();
@@ -745,22 +768,22 @@ public class OFSwitch implements IOFSwitchBackend {
 			s.add(OFType.TABLE_MOD);
 			s.add(OFType.BARRIER_REQUEST);
 			m.put(OFVersion.OF_10, Collections.unmodifiableSet(s));
-			
+
 			s = new HashSet<OFType>();
 			s.addAll(m.get(OFVersion.OF_10));
 			s.add(OFType.GROUP_MOD);
 			s.add(OFType.TABLE_MOD);
 			m.put(OFVersion.OF_11, Collections.unmodifiableSet(s));
-			
+
 			s = new HashSet<OFType>();
 			s.addAll(m.get(OFVersion.OF_11));
 			m.put(OFVersion.OF_12, Collections.unmodifiableSet(s));
-			
+
 			s = new HashSet<OFType>();
 			s.addAll(m.get(OFVersion.OF_12));
 			s.add(OFType.METER_MOD);
 			m.put(OFVersion.OF_13, Collections.unmodifiableSet(s));
-			
+
 			s = new HashSet<OFType>();
 			s.addAll(m.get(OFVersion.OF_13));
 			s.add(OFType.BUNDLE_ADD_MESSAGE);
@@ -771,23 +794,31 @@ public class OFSwitch implements IOFSwitchBackend {
 		}
 
 		/**
-		 * Sorts any invalid messages by moving them from the msgList. The net result
-		 * is a new list returned containing the invalid messages and a pruned msgList
-		 * containing only those messages that are valid for the given role of the controller
-		 * and OpenFlow version of the switch.
+		 * Sorts any invalid messages by moving them from the msgList. The net
+		 * result is a new list returned containing the invalid messages and a
+		 * pruned msgList containing only those messages that are valid for the
+		 * given role of the controller and OpenFlow version of the switch.
 		 * 
-		 * @param msgList the list of messages to sort
-		 * @param valid the list of valid messages (caller must allocate)
-		 * @param swVersion the OFVersion of the switch
-		 * @param isSlave true if controller is slave; false otherwise
-		 * @return list of messages that are not valid, removed from input parameter msgList
+		 * @param msgList
+		 *            the list of messages to sort
+		 * @param valid
+		 *            the list of valid messages (caller must allocate)
+		 * @param swVersion
+		 *            the OFVersion of the switch
+		 * @param isSlave
+		 *            true if controller is slave; false otherwise
+		 * @return list of messages that are not valid, removed from input
+		 *         parameter msgList
 		 */
-		protected static Collection<OFMessage> pruneInvalidMessages(Iterable<OFMessage> msgList, Collection<OFMessage> valid, OFVersion swVersion, boolean isActive) {
+		protected static Collection<OFMessage> pruneInvalidMessages(
+				Iterable<OFMessage> msgList, Collection<OFMessage> valid,
+				OFVersion swVersion, boolean isActive) {
 			if (isActive) { /* master or equal/other support all */
 				valid.addAll(IterableUtils.toCollection(msgList));
 				return Collections.emptyList();
 			} else { /* slave */
-				Set<OFType> invalidSlaveMsgs = invalidSlaveMsgsByOFVersion.get(swVersion);
+				Set<OFType> invalidSlaveMsgs = invalidSlaveMsgsByOFVersion
+						.get(swVersion);
 				List<OFMessage> invalid = new ArrayList<OFMessage>();
 				Iterator<OFMessage> itr = msgList.iterator();
 				while (itr.hasNext()) {
@@ -839,7 +870,6 @@ public class OFSwitch implements IOFSwitchBackend {
 		this.connections.put(connection.getAuxId(), connection);
 	}
 
-
 	@Override
 	public ImmutableList<IOFConnection> getConnections() {
 		return ImmutableList.<IOFConnection> copyOf(this.connections.values());
@@ -857,13 +887,16 @@ public class OFSwitch implements IOFSwitchBackend {
 
 	/**
 	 * Gets a connection specified by aux Id.
-	 * @param auxId the specified aux id for the connection desired.
+	 * 
+	 * @param auxId
+	 *            the specified aux id for the connection desired.
 	 * @return the aux connection specified by the auxId
 	 */
 	public IOFConnection getConnection(OFAuxId auxId) {
 		IOFConnection connection = this.connections.get(auxId);
 		if (connection == null) {
-			throw new IllegalArgumentException("OF Connection for " + this + " with " + auxId + " does not exist.");
+			throw new IllegalArgumentException("OF Connection for " + this
+					+ " with " + auxId + " does not exist.");
 		}
 		return connection;
 	}
@@ -871,32 +904,35 @@ public class OFSwitch implements IOFSwitchBackend {
 	public IOFConnection getConnection(LogicalOFMessageCategory category) {
 		if (switchManager.isCategoryRegistered(category)) {
 			return getConnection(category.getAuxId());
-		}
-		else{
-			throw new IllegalArgumentException(category + " is not registered with the floodlight provider service.");
+		} else {
+			throw new IllegalArgumentException(
+					category
+							+ " is not registered with the floodlight provider service.");
 		}
 	}
 
 	/**
 	 * Write a single message to the switch
 	 * 
-	 * @param m the message to write
-	 * @return true upon success; false upon failure;
-	 * failure can occur either from sending a message not supported in the current role, or
-	 * from the channel being disconnected
+	 * @param m
+	 *            the message to write
+	 * @return true upon success; false upon failure; failure can occur either
+	 *         from sending a message not supported in the current role, or from
+	 *         the channel being disconnected
 	 */
 	@Override
 	public boolean write(OFMessage m) {
 		return this.write(Collections.singletonList(m)).isEmpty();
 	}
 
-
 	/**
 	 * Write a list of messages to the switch
 	 * 
-	 * @param msglist list of messages to write
-	 * @return list of failed messages; messages can fail if sending the messages is not supported
-	 * in the current role, or from the channel becoming disconnected
+	 * @param msglist
+	 *            list of messages to write
+	 * @return list of failed messages; messages can fail if sending the
+	 *         messages is not supported in the current role, or from the
+	 *         channel becoming disconnected
 	 */
 	@Override
 	public Collection<OFMessage> write(Iterable<OFMessage> msglist) {
@@ -909,37 +945,36 @@ public class OFSwitch implements IOFSwitchBackend {
 	}
 
 	@Override
-	public Collection<OFMessage> write(Iterable<OFMessage> msgList, LogicalOFMessageCategory category) {
-		IOFConnection conn = this.getConnection(category); /* do first to check for supported category */
+	public Collection<OFMessage> write(Iterable<OFMessage> msgList,
+			LogicalOFMessageCategory category) {
+		IOFConnection conn = this.getConnection(category); /*
+															 * do first to check
+															 * for supported
+															 * category
+															 */
 		Collection<OFMessage> validMsgs = new ArrayList<OFMessage>();
-		Collection<OFMessage> invalidMsgs = SwitchRoleMessageValidator.pruneInvalidMessages(
-				msgList, validMsgs, this.getOFFactory().getVersion(), this.isActive());
+		Collection<OFMessage> invalidMsgs = SwitchRoleMessageValidator
+				.pruneInvalidMessages(msgList, validMsgs, this.getOFFactory()
+						.getVersion(), this.isActive());
 		if (log.isDebugEnabled()) {
-			log.debug("MESSAGES: {}, VALID: {}, INVALID: {}", new Object[] { msgList, validMsgs, invalidMsgs});
+			log.debug("MESSAGES: {}, VALID: {}, INVALID: {}", new Object[] {
+					msgList, validMsgs, invalidMsgs });
 		}
-		
+
 		if (this.getOFFactory().getVersion().compareTo(OFVersion.OF_14) >= 0) {
-			
+
 			Collection<OFMessage> writeMsgs = new ArrayList<OFMessage>();
 			Collection<OFMessage> readMsgs = new ArrayList<OFMessage>();
-			
+
 			splitWriteReadMsgs(validMsgs, readMsgs, writeMsgs);
-			
+
 			if (writeMsgs.size() > 0) {
-				
-				StringBuilder sb = new StringBuilder();
-				System.out.println();
-				sb.append(" Messages to be sent to the switch: ");
-				for (OFMessage m : msgList)
-					sb.append(m.getType()+ " ");
-				
-				log.info(sb.toString());
 				addToCurrentBundle(writeMsgs);
 			}
-			
+
 			validMsgs = readMsgs;
 		}
-		
+
 		/* Try to write all valid messages */
 		Collection<OFMessage> unsent = conn.write(validMsgs);
 		for (OFMessage m : validMsgs) {
@@ -947,48 +982,56 @@ public class OFSwitch implements IOFSwitchBackend {
 				switchManager.handleOutgoingMessage(this, m);
 			}
 		}
-		
+
 		/* Collect invalid and unsent messages */
 		Collection<OFMessage> ret = null;
 		if (!unsent.isEmpty()) {
-			log.warn("Could not send messages {} due to channel disconnection on switch {}", unsent, this.getId());
+			log.warn(
+					"Could not send messages {} due to channel disconnection on switch {}",
+					unsent, this.getId());
 			ret = IterableUtils.toCollection(unsent);
 		}
 		if (!invalidMsgs.isEmpty()) {
-			log.warn("Could not send messages {} while in SLAVE role on switch {}", invalidMsgs, this.getId());
+			log.warn(
+					"Could not send messages {} while in SLAVE role on switch {}",
+					invalidMsgs, this.getId());
 			if (ret == null) {
 				ret = IterableUtils.toCollection(invalidMsgs);
 			} else {
 				ret.addAll(IterableUtils.toCollection(invalidMsgs));
 			}
 		}
-		
+
 		if (ret == null) {
 			return Collections.emptyList();
 		} else {
 			return ret;
 		}
 	}
-	
+
 	private OFBundle currentBundle;
-	
+
 	private void addToCurrentBundle(Collection<OFMessage> msgs) {
-		if (currentBundle == null || currentBundle.isClosed() || currentBundle.isCommited()) {
+		if (currentBundle == null || currentBundle.isClosed()
+				|| currentBundle.isCommited()) {
 			currentBundle = new OFBundle(this);
 			// commit the bundle in 1 second
-			scheduler.schedule(new BundleCommiter(this, currentBundle), 1L, TimeUnit.SECONDS);
+			scheduler.schedule(new BundleCommiter(this, currentBundle),
+					BUNDLE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 			log.info("## BundleCommiter scheduled ##");
 		}
-		// TODO: passar aqui LogicalOFMessageCategory.MAIN para abstrair no OFBundle
+		// TODO: passar aqui LogicalOFMessageCategory.MAIN para abstrair no
+		// OFBundle
 		Collection<OFMessage> unsent = currentBundle.add(msgs);
-		
+
 		if (unsent == null) {
 			log.error("Bundle already commited! Opening new bundle.");
 			currentBundle = null;
 			addToCurrentBundle(msgs);
 			return;
 		} else if (!unsent.isEmpty()) {
-			log.error("Could not add these messages to the bundle: {}", unsent.toString());
+			log.error("Could not add these messages to the bundle: {}",
+					unsent.toString());
 			// handle any msgs sent
 			for (OFMessage m : msgs) {
 				if (!unsent.contains(m)) {
@@ -996,7 +1039,7 @@ public class OFSwitch implements IOFSwitchBackend {
 				}
 			}
 		} else {
-			if (log.isDebugEnabled())		
+			if (log.isDebugEnabled())
 				log.info("All messages added to the bundle: {}", msgs);
 			// handle all sent msgs
 			for (OFMessage m : msgs) {
@@ -1017,24 +1060,28 @@ public class OFSwitch implements IOFSwitchBackend {
 	}
 
 	@Override
-	public OFConnection getConnectionByCategory(LogicalOFMessageCategory category){
+	public OFConnection getConnectionByCategory(
+			LogicalOFMessageCategory category) {
 		return (OFConnection) this.getConnection(category);
 	}
 
 	@Override
-	public <R extends OFMessage> ListenableFuture<R> writeRequest(OFRequest<R> request, LogicalOFMessageCategory category) {
+	public <R extends OFMessage> ListenableFuture<R> writeRequest(
+			OFRequest<R> request, LogicalOFMessageCategory category) {
 		return getConnection(category).writeRequest(request);
 	}
 
 	@Override
-	public <R extends OFMessage> ListenableFuture<R> writeRequest(OFRequest<R> request) {
+	public <R extends OFMessage> ListenableFuture<R> writeRequest(
+			OFRequest<R> request) {
 		return writeRequest(request, LogicalOFMessageCategory.MAIN);
 	}
 
 	@Override
 	public void disconnect() {
 		// Iterate through connections and perform cleanup
-		for (Entry<OFAuxId, IOFConnectionBackend> entry : this.connections.entrySet()) {
+		for (Entry<OFAuxId, IOFConnectionBackend> entry : this.connections
+				.entrySet()) {
 			entry.getValue().disconnect();
 			this.connections.remove(entry.getKey());
 		}
@@ -1045,9 +1092,11 @@ public class OFSwitch implements IOFSwitchBackend {
 
 	@Override
 	public void setFeaturesReply(OFFeaturesReply featuresReply) {
-		if (portManager.getPorts().isEmpty() && featuresReply.getVersion().compareTo(OFVersion.OF_13) < 0) {
-			/* ports are updated via port status message, so we
-			 * only fill in ports on initial connection.
+		if (portManager.getPorts().isEmpty()
+				&& featuresReply.getVersion().compareTo(OFVersion.OF_13) < 0) {
+			/*
+			 * ports are updated via port status message, so we only fill in
+			 * ports on initial connection.
 			 */
 			List<OFPortDesc> OFPortDescs = featuresReply.getPorts();
 			portManager.updatePorts(OFPortDescs);
@@ -1055,8 +1104,11 @@ public class OFSwitch implements IOFSwitchBackend {
 		this.capabilities = featuresReply.getCapabilities();
 		this.buffers = featuresReply.getNBuffers();
 
-		if (featuresReply.getVersion().compareTo(OFVersion.OF_13) < 0 ) {
-			/* OF1.3+ Per-table actions are set later in the OFTableFeaturesRequest/Reply */
+		if (featuresReply.getVersion().compareTo(OFVersion.OF_13) < 0) {
+			/*
+			 * OF1.3+ Per-table actions are set later in the
+			 * OFTableFeaturesRequest/Reply
+			 */
 			this.actions = featuresReply.getActions();
 		}
 
@@ -1065,8 +1117,9 @@ public class OFSwitch implements IOFSwitchBackend {
 
 	@Override
 	public void setPortDescStats(OFPortDescStatsReply reply) {
-		/* ports are updated via port status message, so we
-		 * only fill in ports on initial connection.
+		/*
+		 * ports are updated via port status message, so we only fill in ports
+		 * on initial connection.
 		 */
 		List<OFPortDesc> OFPortDescs = reply.getEntries();
 		portManager.updatePorts(OFPortDescs);
@@ -1093,8 +1146,8 @@ public class OFSwitch implements IOFSwitchBackend {
 	}
 
 	@Override
-	public OrderedCollection<PortChangeEvent>
-	processOFPortStatus(OFPortStatus ps) {
+	public OrderedCollection<PortChangeEvent> processOFPortStatus(
+			OFPortStatus ps) {
 		return portManager.handlePortStatusMessage(ps);
 	}
 
@@ -1109,17 +1162,20 @@ public class OFSwitch implements IOFSwitchBackend {
 			 */
 			List<OFTableFeatures> tfs = reply.getEntries();
 			for (OFTableFeatures tf : tfs) {
-				tableFeaturesByTableId.put(tf.getTableId(), TableFeatures.of(tf));
+				tableFeaturesByTableId.put(tf.getTableId(),
+						TableFeatures.of(tf));
 				tables.add(tf.getTableId());
-				log.trace("Received TableFeatures for TableId {}, TableName {}", tf.getTableId().toString(), tf.getName());
+				log.trace(
+						"Received TableFeatures for TableId {}, TableName {}",
+						tf.getTableId().toString(), tf.getName());
 			}
 		}
 	}
 
 	@Override
 	public Collection<OFPortDesc> getSortedPorts() {
-		List<OFPortDesc> sortedPorts =
-				new ArrayList<OFPortDesc>(portManager.getPorts());
+		List<OFPortDesc> sortedPorts = new ArrayList<OFPortDesc>(
+				portManager.getPorts());
 		Collections.sort(sortedPorts, new Comparator<OFPortDesc>() {
 			@Override
 			public int compare(OFPortDesc o1, OFPortDesc o2) {
@@ -1137,29 +1193,35 @@ public class OFSwitch implements IOFSwitchBackend {
 	}
 
 	@Override
-	public OrderedCollection<PortChangeEvent>
-	comparePorts(Collection<OFPortDesc> ports) {
+	public OrderedCollection<PortChangeEvent> comparePorts(
+			Collection<OFPortDesc> ports) {
 		return portManager.comparePorts(ports);
 	}
 
 	@Override
-	public OrderedCollection<PortChangeEvent>
-	setPorts(Collection<OFPortDesc> ports) {
+	public OrderedCollection<PortChangeEvent> setPorts(
+			Collection<OFPortDesc> ports) {
 		return portManager.updatePorts(ports);
 	}
 
 	@Override
 	public boolean portEnabled(OFPort portNumber) {
 		OFPortDesc p = portManager.getPort(portNumber);
-		if (p == null) return false;
-		return (!p.getState().contains(OFPortState.BLOCKED) && !p.getState().contains(OFPortState.LINK_DOWN) && !p.getState().contains(OFPortState.STP_BLOCK));
+		if (p == null)
+			return false;
+		return (!p.getState().contains(OFPortState.BLOCKED)
+				&& !p.getState().contains(OFPortState.LINK_DOWN) && !p
+				.getState().contains(OFPortState.STP_BLOCK));
 	}
 
 	@Override
 	public boolean portEnabled(String portName) {
 		OFPortDesc p = portManager.getPort(portName);
-		if (p == null) return false;
-		return (!p.getState().contains(OFPortState.BLOCKED) && !p.getState().contains(OFPortState.LINK_DOWN) && !p.getState().contains(OFPortState.STP_BLOCK));
+		if (p == null)
+			return false;
+		return (!p.getState().contains(OFPortState.BLOCKED)
+				&& !p.getState().contains(OFPortState.LINK_DOWN) && !p
+				.getState().contains(OFPortState.STP_BLOCK));
 	}
 
 	@Override
@@ -1171,7 +1233,8 @@ public class OFSwitch implements IOFSwitchBackend {
 
 	@Override
 	public String toString() {
-		return "OFSwitch DPID[" + ((datapathId != null) ? datapathId.toString() : "?") + "]";
+		return "OFSwitch DPID["
+				+ ((datapathId != null) ? datapathId.toString() : "?") + "]";
 	}
 
 	@Override
@@ -1185,22 +1248,25 @@ public class OFSwitch implements IOFSwitchBackend {
 	}
 
 	@Override
-	public <REPLY extends OFStatsReply> ListenableFuture<List<REPLY>> writeStatsRequest(OFStatsRequest<REPLY> request) {
-		return addInternalStatsReplyListener(connections.get(OFAuxId.MAIN).writeStatsRequest(request), request);
+	public <REPLY extends OFStatsReply> ListenableFuture<List<REPLY>> writeStatsRequest(
+			OFStatsRequest<REPLY> request) {
+		return addInternalStatsReplyListener(connections.get(OFAuxId.MAIN)
+				.writeStatsRequest(request), request);
 	}
 
 	@Override
-	public <REPLY extends OFStatsReply> ListenableFuture<List<REPLY>> writeStatsRequest(OFStatsRequest<REPLY> request, LogicalOFMessageCategory category) {
-		return addInternalStatsReplyListener(getConnection(category).writeStatsRequest(request), request);
-	}	
+	public <REPLY extends OFStatsReply> ListenableFuture<List<REPLY>> writeStatsRequest(
+			OFStatsRequest<REPLY> request, LogicalOFMessageCategory category) {
+		return addInternalStatsReplyListener(getConnection(category)
+				.writeStatsRequest(request), request);
+	}
 
 	/**
-	 * Append a listener to receive an OFStatsReply and update the 
-	 * internal OFSwitch data structures.
+	 * Append a listener to receive an OFStatsReply and update the internal
+	 * OFSwitch data structures.
 	 * 
-	 * This presently taps into the following stats request 
-	 * messages to listen for the corresponding reply:
-	 * -- OFTableFeaturesStatsRequest
+	 * This presently taps into the following stats request messages to listen
+	 * for the corresponding reply: -- OFTableFeaturesStatsRequest
 	 * 
 	 * Extend this to tap into and update other OFStatsType messages.
 	 * 
@@ -1208,7 +1274,9 @@ public class OFSwitch implements IOFSwitchBackend {
 	 * @param request
 	 * @return
 	 */
-	private <REPLY extends OFStatsReply> ListenableFuture<List<REPLY>> addInternalStatsReplyListener(final ListenableFuture<List<REPLY>> future, OFStatsRequest<REPLY> request) {
+	private <REPLY extends OFStatsReply> ListenableFuture<List<REPLY>> addInternalStatsReplyListener(
+			final ListenableFuture<List<REPLY>> future,
+			OFStatsRequest<REPLY> request) {
 		switch (request.getStatsType()) {
 		case TABLE_FEATURES:
 			/* case YOUR_CASE_HERE */
@@ -1220,31 +1288,39 @@ public class OFSwitch implements IOFSwitchBackend {
 				@Override
 				public void run() {
 					/*
-					 * The OFConnection handles REPLY_MORE for us in the case there
-					 * are multiple OFStatsReply messages with the same XID.
+					 * The OFConnection handles REPLY_MORE for us in the case
+					 * there are multiple OFStatsReply messages with the same
+					 * XID.
 					 */
 					try {
 						List<? extends OFStatsReply> replies = future.get();
 						if (!replies.isEmpty()) {
 							/*
-							 * By checking only the 0th element, we assume all others are the same type.
-							 * TODO If not, what then?
+							 * By checking only the 0th element, we assume all
+							 * others are the same type. TODO If not, what then?
 							 */
 							switch (replies.get(0).getStatsType()) {
 							case TABLE_FEATURES:
-								processOFTableFeatures((List<OFTableFeaturesStatsReply>) future.get());
+								processOFTableFeatures((List<OFTableFeaturesStatsReply>) future
+										.get());
 								break;
-								/* case YOUR_CASE_HERE */
+							/* case YOUR_CASE_HERE */
 							default:
-								throw new Exception("Received an invalid OFStatsReply of " 
-										+ replies.get(0).getStatsType().toString() + ". Expected TABLE_FEATURES.");
+								throw new Exception(
+										"Received an invalid OFStatsReply of "
+												+ replies.get(0).getStatsType()
+														.toString()
+												+ ". Expected TABLE_FEATURES.");
 							}
 						}
 					} catch (Exception e) {
 						e.printStackTrace();
 					}
 				}
-			}, MoreExecutors.sameThreadExecutor()); /* No need for another thread. */
+			}, MoreExecutors.sameThreadExecutor()); /*
+													 * No need for another
+													 * thread.
+													 */
 		default:
 			break;
 		}
@@ -1253,7 +1329,8 @@ public class OFSwitch implements IOFSwitchBackend {
 
 	@Override
 	public void cancelAllPendingRequests() {
-		for(Entry<OFAuxId, IOFConnectionBackend> entry : this.connections.entrySet()){
+		for (Entry<OFAuxId, IOFConnectionBackend> entry : this.connections
+				.entrySet()) {
 			entry.getValue().cancelAllPendingRequests();
 		}
 	}
@@ -1267,7 +1344,8 @@ public class OFSwitch implements IOFSwitchBackend {
 	@Override
 	public boolean isActive() {
 		// no lock needed since we use volatile
-		return isConnected() && (this.role == OFControllerRole.ROLE_MASTER || this.role == OFControllerRole.ROLE_EQUAL);
+		return isConnected()
+				&& (this.role == OFControllerRole.ROLE_MASTER || this.role == OFControllerRole.ROLE_EQUAL);
 	}
 
 	@Override
@@ -1282,6 +1360,7 @@ public class OFSwitch implements IOFSwitchBackend {
 
 	/**
 	 * Get the IP Address for the switch
+	 * 
 	 * @return the inet address
 	 */
 	@Override
@@ -1294,22 +1373,18 @@ public class OFSwitch implements IOFSwitchBackend {
 		return buffers;
 	}
 
-
 	@Override
 	public Set<OFActionType> getActions() {
 		return actions;
 	}
-
 
 	@Override
 	public Set<OFCapabilities> getCapabilities() {
 		return capabilities;
 	}
 
-
 	/**
-	 * This performs a copy on each 'get'.
-	 * Use sparingly for good performance.
+	 * This performs a copy on each 'get'. Use sparingly for good performance.
 	 */
 	@Override
 	public Collection<TableId> getTables() {
@@ -1330,8 +1405,8 @@ public class OFSwitch implements IOFSwitchBackend {
 	public void setTableFull(boolean isFull) {
 		if (isFull && !flowTableFull) {
 			switchManager.addSwitchEvent(this.datapathId,
-					"SWITCH_FLOW_TABLE_FULL " +
-							"Table full error from switch", false);
+					"SWITCH_FLOW_TABLE_FULL " + "Table full error from switch",
+					false);
 			log.warn("Switch {} flow table is full", datapathId.toString());
 		}
 		flowTableFull = isFull;
@@ -1364,7 +1439,6 @@ public class OFSwitch implements IOFSwitchBackend {
 		this.description = description;
 	}
 
-
 	@Override
 	public SwitchStatus getStatus() {
 		return status;
@@ -1376,61 +1450,72 @@ public class OFSwitch implements IOFSwitchBackend {
 	}
 
 	@Override
-	public void updateControllerConnections(OFBsnControllerConnectionsReply controllerCxnsReply) {
+	public void updateControllerConnections(
+			OFBsnControllerConnectionsReply controllerCxnsReply) {
 
-		// Instantiate clean map, can't use a builder here since we need to call temp.get()
-		Map<URI,Map<OFAuxId, OFBsnControllerConnection>> temp = new ConcurrentHashMap<URI,Map<OFAuxId, OFBsnControllerConnection>>();
+		// Instantiate clean map, can't use a builder here since we need to call
+		// temp.get()
+		Map<URI, Map<OFAuxId, OFBsnControllerConnection>> temp = new ConcurrentHashMap<URI, Map<OFAuxId, OFBsnControllerConnection>>();
 
-		List<OFBsnControllerConnection> controllerCxnUpdates = controllerCxnsReply.getConnections();
-		for(OFBsnControllerConnection update : controllerCxnUpdates) {
+		List<OFBsnControllerConnection> controllerCxnUpdates = controllerCxnsReply
+				.getConnections();
+		for (OFBsnControllerConnection update : controllerCxnUpdates) {
 			URI uri = URI.create(update.getUri());
 
 			Map<OFAuxId, OFBsnControllerConnection> cxns = temp.get(uri);
 
 			// Add to nested map
-			if(cxns != null){
+			if (cxns != null) {
 				cxns.put(update.getAuxiliaryId(), update);
-			} else{
+			} else {
 				cxns = new ConcurrentHashMap<OFAuxId, OFBsnControllerConnection>();
 				cxns.put(update.getAuxiliaryId(), update);
 				temp.put(uri, cxns);
 			}
 		}
 
-		this.controllerConnections = ImmutableMap.<URI,Map<OFAuxId, OFBsnControllerConnection>>copyOf(temp);
+		this.controllerConnections = ImmutableMap
+				.<URI, Map<OFAuxId, OFBsnControllerConnection>> copyOf(temp);
 	}
 
 	@Override
 	public boolean hasAnotherMaster() {
 
-		//TODO: refactor get connection to not throw illegal arg exceptions
+		// TODO: refactor get connection to not throw illegal arg exceptions
 		IOFConnection mainCxn = this.getConnection(OFAuxId.MAIN);
 
-		if(mainCxn != null) {
+		if (mainCxn != null) {
 
 			// Determine the local URI
-			InetSocketAddress address = (InetSocketAddress) mainCxn.getLocalInetAddress();
-			URI localURI = URIUtil.createURI(address.getHostName(), address.getPort());
+			InetSocketAddress address = (InetSocketAddress) mainCxn
+					.getLocalInetAddress();
+			URI localURI = URIUtil.createURI(address.getHostName(),
+					address.getPort());
 
-			for(Entry<URI,Map<OFAuxId, OFBsnControllerConnection>> entry : this.controllerConnections.entrySet()) {
+			for (Entry<URI, Map<OFAuxId, OFBsnControllerConnection>> entry : this.controllerConnections
+					.entrySet()) {
 
 				// Don't check our own controller connections
 				URI uri = entry.getKey();
-				if(!localURI.equals(uri)){
+				if (!localURI.equals(uri)) {
 
 					// We only care for the MAIN connection
-					Map<OFAuxId, OFBsnControllerConnection> cxns = this.controllerConnections.get(uri);
-					OFBsnControllerConnection controllerCxn = cxns.get(OFAuxId.MAIN);
+					Map<OFAuxId, OFBsnControllerConnection> cxns = this.controllerConnections
+							.get(uri);
+					OFBsnControllerConnection controllerCxn = cxns
+							.get(OFAuxId.MAIN);
 
-					if(controllerCxn != null) {
-						// If the controller id disconnected or not master we know it is not connected
-						if(controllerCxn.getState() == OFBsnControllerConnectionState.BSN_CONTROLLER_CONNECTION_STATE_CONNECTED
-								&& controllerCxn.getRole() == OFControllerRole.ROLE_MASTER){
+					if (controllerCxn != null) {
+						// If the controller id disconnected or not master we
+						// know it is not connected
+						if (controllerCxn.getState() == OFBsnControllerConnectionState.BSN_CONTROLLER_CONNECTION_STATE_CONNECTED
+								&& controllerCxn.getRole() == OFControllerRole.ROLE_MASTER) {
 							return true;
 						}
 					} else {
-						log.warn("Unable to find controller connection with aux id "
-								+ "MAIN for switch {} on controller with URI {}.",
+						log.warn(
+								"Unable to find controller connection with aux id "
+										+ "MAIN for switch {} on controller with URI {}.",
 								this, uri);
 					}
 				}
@@ -1452,7 +1537,8 @@ public class OFSwitch implements IOFSwitchBackend {
 	@Override
 	public TableId setMaxTableForTableMissFlow(TableId max) {
 		if (max.getValue() >= nTables) {
-			maxTableToGetTableMissFlow = TableId.of(nTables - 1 < 0 ? 0 : nTables - 1);
+			maxTableToGetTableMissFlow = TableId.of(nTables - 1 < 0 ? 0
+					: nTables - 1);
 		} else {
 			maxTableToGetTableMissFlow = max;
 		}
